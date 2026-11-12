@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dusk Dash</title>
+<style>
+  /* ---------- Theme tokens ---------- */
+  :root {
+    --bg: #12082a;
+    --ink: #f3e9ff;
+    --muted: #a58bd0;
+    --accent: #3de0ff;
+    --line: #3d1b6e;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Courier New", ui-monospace, monospace;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+
+  /* Centre the game in whatever frame size the iframe gives us */
+  body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 8px;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  .screen {
+    position: relative;
+    width: 100%;
+    max-width: 900px;
+    border: 3px solid var(--line);
+    border-radius: 6px;
+    overflow: hidden;
+    touch-action: none; /* stop taps from scrolling/zooming the page */
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    aspect-ratio: 640 / 240;
+    image-rendering: pixelated;
+    outline: none;
+  }
+
+  /* Faint CRT scanlines */
+  .screen::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0 2px, rgba(0,0,0,.14) 2px 3px);
+  }
+
+  .bar {
+    width: 100%;
+    max-width: 900px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  button {
+    font: inherit;
+    color: var(--ink);
+    background: transparent;
+    border: 2px solid var(--line);
+    border-radius: 4px;
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<div class="screen" id="screen">
+  <canvas id="game" width="640" height="240" tabindex="0"
+          aria-label="Dusk Dash game. Press space, up arrow, or tap to jump."></canvas>
+</div>
+
+<div class="bar">
+  <span>Tap, click, or press Space to jump. Hold for a higher jump.</span>
+  <button id="mute" type="button" aria-pressed="false">Sound: on</button>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ---------- Constants ---------- */
+  const W = 640, H = 240;
+  const GROUND = 196;            // y of the ground line
+  const PX = 3;                  // sprite pixel size
+  const GRAVITY = 1800;          // px/s^2
+  const JUMP_V = -620;           // initial jump velocity
+  const START_SPEED = 280, MAX_SPEED = 640, ACCEL = 8;
+  const COIN_POINTS = 50;
+
+  const C = {
+    skyTop: '#1a1038', skyMid: '#5a1f6e', skyLow: '#e0457b',
+    sun: '#ffc83d', far: '#2b1458', near: '#3d1b6e',
+    ground: '#1f0f3a', edge: '#3de0ff', dash: '#3d1b6e',
+    crate: '#ff6b4a', crateHi: '#ffd1b0', outline: '#12082a',
+    coin: '#ffc83d', coinHi: '#fff3b0', text: '#f3e9ff'
+  };
+
+  /* ---------- Setup ---------- */
+  const cv = document.getElementById('game');
+  const ctx = cv.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  const muteBtn = document.getElementById('mute');
+  const screenEl = document.getElementById('screen');
+
+  // High score. Storage can be blocked inside iframes, so always guard it.
+  let hi = 0;
+  try { hi = parseInt(localStorage.getItem('dusk-dash-hi'), 10) || 0; } catch (e) {}
+  const saveHi = () => { try { localStorage.setItem('dusk-dash-hi', String(hi)); } catch (e) {} };
+
+  /* ---------- Sprite (10 x 12 grid) ---------- */
+  const PAL = { h: '#ffc83d', s: '#ffd7b0', k: '#12082a', b: '#ff4f9a', l: '#3de0ff' };
+  const BODY = [
+    '...hhhh...',
+    '..hhhhhh..',
+    '..hsskss..',
+    '..ssssss..',
+    '...bbbb...',
+    '.sbbbbbbs.',
+    '.sbbbbbbs.',
+    '..bbbbbb..',
+    '..bbbbbb..'
+  ];
+  const LEGS_A = ['..ll..ll..', '..ll..ll..', '.kkk..kkk.'];
+  const LEGS_B = ['...llll...', '...llll...', '..kkkkkk..'];
+  const SPRITE_H = 12 * PX;
+
+  /* ---------- Game state ---------- */
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const player = { x: 60, y: GROUND - SPRITE_H, vy: 0, w: 10 * PX, h: SPRITE_H, onGround: true };
+  const stars = Array.from({ length: 36 }, () => ({ x: rnd(0, W), y: rnd(6, 110), s: Math.random() < .2 ? 2 : 1 }));
+
+  let state = 'ready';           // ready | play | over
+  let obstacles = [], coins = [];
+  let speed, dist, coinCount, score, gapLeft, overAt = 0, shake = 0;
+
+  function reset() {
+    speed = START_SPEED; dist = 0; coinCount = 0; score = 0;
+    obstacles = []; coins = []; gapLeft = 260;
+    Object.assign(player, { y: GROUND - SPRITE_H, vy: 0, onGround: true });
+  }
+  reset();
+
+  /* ---------- Audio (tiny WebAudio beeps, created on first input) ---------- */
+  let audio = null, muted = false;
+  function beep(freq, dur, type = 'square', vol = 0.05, slideTo) {
+    if (muted) return;
+    try {
+      audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+      if (audio.state === 'suspended') audio.resume();
+      const o = audio.createOscillator(), g = audio.createGain();
+      o.type = type;
+      o.frequency.setValueAtTime(freq, audio.currentTime);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, audio.currentTime + dur);
+      g.gain.setValueAtTime(vol, audio.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, audio.currentTime + dur);
+      o.connect(g); g.connect(audio.destination);
+      o.start(); o.stop(audio.currentTime + dur);
+    } catch (e) { /* audio is optional */ }
+  }
+
+  /* ---------- Input ---------- */
+  function press() {
+    if (state === 'ready') { reset(); state = 'play'; }
+    else if (state === 'over') {
+      if (performance.now() - overAt < 500) return; // avoid instant restart from a panic tap
+      reset(); state = 'play';
+    }
+    if (state === 'play' && player.onGround) {
+      player.vy = JUMP_V; player.onGround = false;
+      beep(300, 0.14, 'square', 0.05, 640);
+    }
+  }
+  function release() {
+    if (player.vy < -260) player.vy = -260; // short tap = short hop
+  }
+
+  screenEl.addEventListener('pointerdown', e => { e.preventDefault(); press(); });
+  window.addEventListener('pointerup', release);
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') {
+      e.preventDefault();
+      if (!e.repeat) press();
+    }
+  });
+  window.addEventListener('keyup', e => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') release();
+  });
+  muteBtn.addEventListener('click', () => {
+    muted = !muted;
+    muteBtn.textContent = 'Sound: ' + (muted ? 'off' : 'on');
+    muteBtn.setAttribute('aria-pressed', String(muted));
+  });
+
+  /* ---------- Update ---------- */
+  function spawn() {
+    const w = Math.round(rnd(22, 40)), h = Math.round(rnd(26, 48));
+    obstacles.push({ x: W + 20, w, h });
+    // Gap scales with speed so every jump stays fair
+    gapLeft = speed * rnd(0.85, 1.5) + 150 + w;
+    if (Math.random() < 0.45) {
+      coins.push({ x: W + 20 + w + gapLeft * 0.5, y: GROUND - rnd(50, 95), r: 7 });
+    }
+  }
+
+  function hit(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  function update(dt) {
+    if (state !== 'play') return;
+
+    speed = Math.min(MAX_SPEED, speed + ACCEL * dt);
+    dist += speed * dt;
+
+    // Player physics
+    player.vy += GRAVITY * dt;
+    player.y += player.vy * dt;
+    if (player.y >= GROUND - player.h) {
+      player.y = GROUND - player.h; player.vy = 0; player.onGround = true;
+    }
+
+    // Spawning
+    gapLeft -= speed * dt;
+    if (gapLeft <= 0) spawn();
+
+    // Hitbox is slightly smaller than the sprite for forgiving collisions
+    const box = { x: player.x + 5, y: player.y + 4, w: player.w - 10, h: player.h - 6 };
+
+    for (const o of obstacles) {
+      o.x -= speed * dt;
+      if (hit(box, { x: o.x + 3, y: GROUND - o.h + 3, w: o.w - 6, h: o.h - 3 })) return gameOver();
+    }
+    obstacles = obstacles.filter(o => o.x + o.w > -10);
+
+    for (const c of coins) {
+      c.x -= speed * dt;
+      if (!c.got && hit(box, { x: c.x - c.r, y: c.y - c.r, w: c.r * 2, h: c.r * 2 })) {
+        c.got = true; coinCount++;
+        beep(880, 0.07, 'square', 0.05); setTimeout(() => beep(1320, 0.1, 'square', 0.05), 70);
+      }
+    }
+    coins = coins.filter(c => !c.got && c.x > -20);
+
+    score = Math.floor(dist / 10) + coinCount * COIN_POINTS;
+  }
+
+  function gameOver() {
+    state = 'over'; overAt = performance.now(); shake = 0.25;
+    if (score > hi) { hi = score; saveHi(); }
+    beep(220, 0.45, 'sawtooth', 0.07, 55);
+  }
+
+  /* ---------- Drawing ---------- */
+  const rect = (x, y, w, h, col) => { ctx.fillStyle = col; ctx.fillRect(Math.round(x), Math.round(y), w, h); };
+
+  function drawBackground() {
+    const g = ctx.createLinearGradient(0, 0, 0, GROUND);
+    g.addColorStop(0, C.skyTop); g.addColorStop(0.55, C.skyMid); g.addColorStop(1, C.skyLow);
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, GROUND);
+
+    // Stars drift slowly
+    const sx = dist * 0.02;
+    for (const s of stars) rect(((s.x - sx) % W + W) % W, s.y, s.s, s.s, '#f3e9ff');
+
+    // Pixel sun with horizontal slits in the lower half
+    const cx = 470, cy = 128, r = 44;
+    for (let dy = -r; dy < r; dy += 4) {
+      if (dy > 0 && Math.floor(dy / 4) % 2 === 1) continue;
+      const hw = Math.floor(Math.sqrt(r * r - dy * dy));
+      rect(cx - hw, cy + dy, hw * 2, 4, C.sun);
+    }
+
+    // Two parallax mountain layers
+    mountains(0.08, 320, 70, C.far, GROUND - 4);
+    mountains(0.18, 240, 46, C.near, GROUND);
+  }
+
+  function mountains(factor, period, height, col, base) {
+    const off = (dist * factor) % period;
+    ctx.fillStyle = col;
+    for (let x = -period - off; x < W + period; x += period) {
+      ctx.beginPath();
+      ctx.moveTo(x, base);
+      ctx.lineTo(x + period * 0.5, base - height);
+      ctx.lineTo(x + period, base);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  function drawGround() {
+    rect(0, GROUND, W, H - GROUND, C.ground);
+    rect(0, GROUND, W, 3, C.edge);
+    const off = dist % 48;
+    for (let x = -off; x < W; x += 48) {
+      rect(x, GROUND + 16, 24, 3, C.dash);
+      rect(x + 24, GROUND + 30, 24, 3, C.dash);
+    }
+  }
+
+  function drawPlayer(t) {
+    const legs = (!player.onGround || state !== 'play') ? LEGS_B
+               : (Math.floor(t / 90) % 2 ? LEGS_A : LEGS_B);
+    const rows = BODY.concat(legs);
+    for (let r = 0; r < rows.length; r++) {
+      for (let c = 0; c < 10; c++) {
+        const ch = rows[r][c];
+        if (ch !== '.') rect(player.x + c * PX, player.y + r * PX, PX, PX, PAL[ch]);
+      }
+    }
+  }
+
+  function drawObstacle(o) {
+    const y = GROUND - o.h;
+    rect(o.x, y, o.w, o.h, C.outline);
+    rect(o.x + 3, y + 3, o.w - 6, o.h - 3, C.crate);
+    rect(o.x + 3, y + 3, o.w - 6, 4, C.crateHi);
+    rect(o.x + o.w / 2 - 2, y + 9, 4, o.h - 12, C.outline); // crate slat
+  }
+
+  function drawCoin(c, t) {
+    const squash = Math.abs(Math.sin(t / 220));           // spinning effect
+    const w = Math.max(2, Math.round(c.r * 2 * squash));
+    rect(c.x - w / 2, c.y - c.r, w, c.r * 2, C.coin);
+    rect(c.x - w / 2, c.y - c.r, Math.max(1, w / 3), c.r * 2, C.coinHi);
+  }
+
+  function text(str, x, y, size, align = 'left', col = C.text) {
+    ctx.font = `bold ${size}px "Courier New", monospace`;
+    ctx.textAlign = align; ctx.textBaseline = 'top';
+    ctx.fillStyle = '#12082a'; ctx.fillText(str, x + 2, y + 2); // hard drop shadow
+    ctx.fillStyle = col;      ctx.fillText(str, x, y);
+  }
+
+  const pad = n => String(n).padStart(5, '0');
+
+  function draw(t) {
+    ctx.save();
+    if (shake > 0) ctx.translate(rnd(-4, 4), rnd(-3, 3));
+
+    drawBackground();
+    drawGround();
+    coins.forEach(c => drawCoin(c, t));
+    obstacles.forEach(drawObstacle);
+    drawPlayer(t);
+
+    ctx.restore();
+
+    // HUD
+    text('SCORE ' + pad(score), 14, 12, 16);
+    text('HI ' + pad(hi), W - 14, 12, 16, 'right', '#ffc83d');
+
+    // Overlays
+    if (state !== 'play') {
+      ctx.fillStyle = 'rgba(18, 8, 42, 0.55)';
+      ctx.fillRect(0, 0, W, H);
+      const blink = Math.floor(t / 500) % 2 === 0;
+      if (state === 'ready') {
+        text('DUSK DASH', W / 2, 62, 44, 'center', '#ff4f9a');
+        if (blink) text('Tap or press Space to start', W / 2, 128, 18, 'center');
+      } else {
+        text('GAME OVER', W / 2, 52, 40, 'center', '#ff6b4a');
+        text('Score ' + score + (score && score === hi ? '  New best!' : ''), W / 2, 106, 20, 'center');
+        if (blink) text('Tap to run again', W / 2, 140, 18, 'center');
+      }
+    }
+  }
+
+  /* ---------- Main loop ---------- */
+  let last = 0;
+  function frame(ts) {
+    const dt = Math.min(0.033, (ts - last) / 1000 || 0); // cap dt so tab switches don't teleport
+    last = ts;
+    if (shake > 0) shake -= dt;
+    update(dt);
+    draw(ts);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
